@@ -147,12 +147,16 @@ export function readPack(buf: Buffer, lookup: (oid: string) => GitObject | undef
       baseObj = objects.get(baseOid) ?? lookup(baseOid);
       if (!baseObj) throw new Error('ref-delta base not found');
     }
-    const inflated = inflateSync(buf.subarray(off));
-    // inflateSync consumes the whole remaining buffer; find the true length
-    // by re-inflating with a bounded approach: use the known object size.
-    const data = inflated.subarray(0, size);
-    // Compute how many input bytes the deflate stream used.
-    off = findDeflateEnd(buf, off);
+    const inflated = inflateSync(buf.subarray(off), { info: true }) as unknown as {
+      buffer: Buffer;
+      engine: { bytesWritten: number };
+    };
+    // For inflate, engine.bytesWritten is the number of compressed input
+    // bytes the stream consumed (zlib's maintained field; bytesRead is
+    // deprecated). The inflated data is exactly `size` bytes for a valid pack.
+    const data = inflated.buffer.subarray(0, size);
+    if (inflated.buffer.length !== size) throw new Error('pack object size mismatch');
+    off += inflated.engine.bytesWritten;
     let obj: GitObject;
     if (typeCode === 6 || typeCode === 7) {
       const resolved = applyDelta(baseObj!.data, data);
@@ -165,24 +169,6 @@ export function readPack(buf: Buffer, lookup: (oid: string) => GitObject | undef
     byOffset.set(entryOff, obj);
   }
   return objects;
-}
-
-// Find where a raw-deflate stream starting at `start` ends, by trial inflation.
-function findDeflateEnd(buf: Buffer, start: number): number {
-  // Binary search the smallest end that inflates without error and yields a
-  // complete stream (inflateSync throws on truncation).
-  let lo = start + 1;
-  let hi = buf.length;
-  while (lo < hi) {
-    const mid = (lo + hi) >> 1;
-    try {
-      inflateSync(buf.subarray(start, mid));
-      hi = mid;
-    } catch {
-      lo = mid + 1;
-    }
-  }
-  return lo;
 }
 
 function writeVarintHeader(typeCode: number, size: number): Buffer {
@@ -323,10 +309,12 @@ export function advertiseUploadPack(repo: Repo, v2: boolean): Buffer {
     return Buffer.concat(parts);
   }
   const refs = refLines(repo);
+  const headOid = repo.refs.get(headRefName(repo));
   if (refs.length === 0) {
     parts.push(pktLine(`${ZERO_OID} capabilities^{}\0${UPLOAD_V0_CAPS}\n`));
   } else {
-    parts.push(pktLine(`${refs[0].oid} HEAD\0${UPLOAD_V0_CAPS}\n`));
+    // HEAD carries the default branch's tip (not the alphabetically-first ref).
+    parts.push(pktLine(`${headOid ?? refs[0].oid} HEAD\0${UPLOAD_V0_CAPS}\n`));
     for (const r of refs) {
       parts.push(pktLine(`${r.oid} ${r.name}\n`));
       if (r.peeled) parts.push(pktLine(`${r.peeled} ${r.name}^{}\n`));
@@ -341,10 +329,12 @@ export function advertiseReceivePack(repo: Repo): Buffer {
   parts.push(pktLine('# service=git-receive-pack\n'));
   parts.push(FLUSH);
   const refs = refLines(repo);
+  const headOid = repo.refs.get(headRefName(repo));
   if (refs.length === 0) {
     parts.push(pktLine(`${ZERO_OID} capabilities^{}\0${RECEIVE_CAPS}\n`));
   } else {
-    parts.push(pktLine(`${refs[0].oid} HEAD\0${RECEIVE_CAPS}\n`));
+    // HEAD carries the default branch's tip (not the alphabetically-first ref).
+    parts.push(pktLine(`${headOid ?? refs[0].oid} HEAD\0${RECEIVE_CAPS}\n`));
     for (const r of refs) parts.push(pktLine(`${r.oid} ${r.name}\n`));
   }
   parts.push(FLUSH);
